@@ -1,0 +1,22 @@
+{
+  "name": "crm-sync",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Sync service between upstream systems (Logto, Stripe, Listmonk, PostHog) and Twenty CRM for Meridian Insights / IPSG.",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch index.ts"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "libphonenumber-js": "^1.13.8"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.9",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.2"
+  }
+}
