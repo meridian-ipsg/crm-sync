@@ -69,3 +69,33 @@ export async function upsertPersonByLogtoUserId(
   }
   return createPerson({ ...fields, logtoUserId });
 }
+
+// Stage 2 (Meridian Phase 7) — Topic/Geography/Sector taxonomy, read-only
+// from crm-sync's side (Twenty is authoritative, this service never writes
+// these back). All three are small, fixed-size custom objects (~20/8/7
+// records at the time of writing per Mark's research brief) - a single
+// generously-limited request covers the whole collection, confirmed
+// against the real data (limit=100 returns hasNextPage: false for all
+// three), so this deliberately doesn't implement cursor pagination.
+export type TwentyTaxonomyRecord = {
+  id: string;
+  name: string;
+  slug: string;
+};
+
+async function getAllTaxonomy<K extends string>(path: string, dataKey: K): Promise<TwentyTaxonomyRecord[]> {
+  const data = await request<Record<K, TwentyTaxonomyRecord[]>>(`${path}?limit=200`);
+  return data[dataKey];
+}
+
+export async function getTopics(): Promise<TwentyTaxonomyRecord[]> {
+  return getAllTaxonomy('/rest/topics', 'topics');
+}
+
+export async function getGeographies(): Promise<TwentyTaxonomyRecord[]> {
+  return getAllTaxonomy('/rest/geographies', 'geographies');
+}
+
+export async function getSectors(): Promise<TwentyTaxonomyRecord[]> {
+  return getAllTaxonomy('/rest/sectors', 'sectors');
+}

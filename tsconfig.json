@@ -12,6 +12,6 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true
   },
-  "include": ["index.ts", "lib/**/*.ts", "connectors/**/*.ts"],
+  "include": ["index.ts", "lib/**/*.ts", "connectors/**/*.ts", "jobs/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }
