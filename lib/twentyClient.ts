@@ -41,6 +41,14 @@ export async function findPersonByLogtoUserId(logtoUserId: string): Promise<Pers
   return data.people[0] ?? null;
 }
 
+// Composite fields filter on their sub-path (confirmed against the live
+// instance): emails.primaryEmail[eq]:"...".
+export async function findPersonByEmail(email: string): Promise<PersonRecord | null> {
+  const encoded = encodeURIComponent(`emails.primaryEmail[eq]:"${email}"`);
+  const data = await request<{ people: PersonRecord[] }>(`/rest/people?filter=${encoded}&limit=1`);
+  return data.people[0] ?? null;
+}
+
 export async function createPerson(fields: Record<string, unknown>): Promise<PersonRecord> {
   const data = await request<{ createPerson: PersonRecord }>('/rest/people', {
     method: 'POST',
@@ -58,7 +66,9 @@ export async function updatePerson(id: string, fields: Record<string, unknown>):
 }
 
 // Upsert keyed on logtoUserId, the sync key set at signup (§3 of the data model doc).
-// Used by connectors/logto.ts for both User.Created and User.Data.Updated events.
+// Used by connectors/logto.ts for User.Data.Updated events, where the Person
+// this user maps to has necessarily already been created/adopted by a prior
+// signup event.
 export async function upsertPersonByLogtoUserId(
   logtoUserId: string,
   fields: Record<string, unknown>
@@ -68,6 +78,38 @@ export async function upsertPersonByLogtoUserId(
     return updatePerson(existing.id, fields);
   }
   return createPerson({ ...fields, logtoUserId });
+}
+
+export type SignupSyncOutcome = 'created' | 'adopted' | 'updated';
+
+// Signup-time upsert (Meridian Phase 8a). Twenty and IPSG share one CRM
+// instance, so a Meridian signup's email colliding with an existing
+// consulting-relationship Person is a realistic first-user scenario, not an
+// edge case - matched and adopted here rather than left to create a
+// duplicate, same adopt-and-backfill principle Phase 7 applied to taxonomy.
+//   1. logtoUserId match  -> already synced (e.g. a retried/duplicate
+//                            delivery of the same signup event), update in place
+//   2. email match        -> adopt: link this signup to the existing Person
+//                            rather than duplicating it
+//   3. neither            -> genuinely new, create
+export async function upsertPersonForSignup(
+  logtoUserId: string,
+  email: string | null,
+  fields: Record<string, unknown>
+): Promise<{ person: PersonRecord; outcome: SignupSyncOutcome }> {
+  const byLogtoUserId = await findPersonByLogtoUserId(logtoUserId);
+  if (byLogtoUserId) {
+    return { person: await updatePerson(byLogtoUserId.id, fields), outcome: 'updated' };
+  }
+
+  if (email) {
+    const byEmail = await findPersonByEmail(email);
+    if (byEmail) {
+      return { person: await updatePerson(byEmail.id, { ...fields, logtoUserId }), outcome: 'adopted' };
+    }
+  }
+
+  return { person: await createPerson({ ...fields, logtoUserId }), outcome: 'created' };
 }
 
 // Stage 2 (Meridian Phase 7) — Topic/Geography/Sector taxonomy, read-only
