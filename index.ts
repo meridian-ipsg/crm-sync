@@ -6,6 +6,8 @@ import express from 'express';
 import cron from 'node-cron';
 import { handleLogtoWebhook, LogtoWebhookPayload } from './connectors/logto';
 import { runNightlyTaxonomySync } from './jobs/nightlyTaxonomySync';
+import { runNightlyEngagementSync } from './jobs/nightlyEngagementSync';
+import { handleLeadCapture, LeadCapturePayload } from './connectors/leadCapture';
 
 const PORT = process.env.PORT || 3000;
 const LOGTO_WEBHOOK_SIGNING_KEY = process.env.LOGTO_WEBHOOK_SIGNING_KEY;
@@ -19,6 +21,18 @@ if (!SYNC_TRIGGER_TOKEN) {
 }
 
 const app = express();
+
+// Shared-secret bearer check used by every internal trigger endpoint below
+// (not the Logto webhook, which verifies via HMAC signature instead since
+// that's actually authenticating an external system, not gating an
+// internal trigger against anyone who doesn't have the token).
+function isValidBearer(req: express.Request, expectedToken: string): boolean {
+  const auth = req.header('authorization');
+  const expected = `Bearer ${expectedToken}`;
+  const authBuffer = auth ? Buffer.from(auth) : null;
+  const expectedBuffer = Buffer.from(expected);
+  return authBuffer !== null && authBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(authBuffer, expectedBuffer);
+}
 
 // Logto signs the raw body, so this route needs the raw buffer, not JSON-parsed.
 app.post('/webhooks/logto', express.raw({ type: 'application/json' }), async (req, res) => {
@@ -53,20 +67,9 @@ app.post('/webhooks/logto', express.raw({ type: 'application/json' }), async (re
   }
 });
 
-// Manual re-sync trigger for Phase 7's taxonomy connector. Simple shared-
-// secret bearer check rather than the webhook's HMAC signature — this
-// isn't verifying an external system's identity the way the Logto webhook
-// does, just gating an internal trigger endpoint against anyone who
-// doesn't have the token.
+// Manual re-sync trigger for Phase 7's taxonomy connector.
 app.post('/sync/taxonomy', express.json(), async (req, res) => {
-  const auth = req.header('authorization');
-  const expected = `Bearer ${SYNC_TRIGGER_TOKEN}`;
-  const authBuffer = auth ? Buffer.from(auth) : null;
-  const expectedBuffer = Buffer.from(expected);
-  const isValid =
-    authBuffer !== null && authBuffer.length === expectedBuffer.length && crypto.timingSafeEqual(authBuffer, expectedBuffer);
-
-  if (!isValid) {
+  if (!isValidBearer(req, SYNC_TRIGGER_TOKEN as string)) {
     res.status(401).send('invalid token');
     return;
   }
@@ -76,6 +79,42 @@ app.post('/sync/taxonomy', express.json(), async (req, res) => {
     res.status(200).send('ok');
   } catch (err) {
     console.error('manual taxonomy sync trigger failed', err);
+    res.status(500).send('internal error');
+  }
+});
+
+// Manual trigger for Phase 9's engagement scoring job — same trigger token,
+// same pattern as the taxonomy sync above.
+app.post('/sync/engagement', express.json(), async (req, res) => {
+  if (!isValidBearer(req, SYNC_TRIGGER_TOKEN as string)) {
+    res.status(401).send('invalid token');
+    return;
+  }
+
+  try {
+    await runNightlyEngagementSync();
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('manual engagement sync trigger failed', err);
+    res.status(500).send('internal error');
+  }
+});
+
+// Phase 9's Enterprise lead-capture trigger — called best-effort by
+// meridian-insights-website's /api/lead route after its Resend email
+// succeeds. Reuses the same trigger token rather than provisioning a
+// separate secret for one more internal caller.
+app.post('/webhooks/lead-capture', express.json(), async (req, res) => {
+  if (!isValidBearer(req, SYNC_TRIGGER_TOKEN as string)) {
+    res.status(401).send('invalid token');
+    return;
+  }
+
+  try {
+    await handleLeadCapture(req.body as LeadCapturePayload);
+    res.status(200).send('ok');
+  } catch (err) {
+    console.error('lead capture task creation failed', err);
     res.status(500).send('internal error');
   }
 });
@@ -96,4 +135,14 @@ app.listen(PORT, () => {
     });
   });
   console.log('[taxonomy-sync] nightly schedule registered (02:00 daily)');
+
+  // Nightly engagement scoring (Phase 9), 03:00 server time daily — after
+  // the taxonomy sync, no dependency between them, just avoids both jobs
+  // hitting Twenty at the exact same minute.
+  cron.schedule('0 3 * * *', () => {
+    runNightlyEngagementSync().catch((err) => {
+      console.error('[engagement-sync] scheduled run threw unexpectedly', err);
+    });
+  });
+  console.log('[engagement-sync] nightly schedule registered (03:00 daily)');
 });

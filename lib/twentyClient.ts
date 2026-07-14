@@ -9,6 +9,12 @@ if (!TOKEN) {
   throw new Error('TWENTY_API_TOKEN environment variable is required');
 }
 
+export class TwentyRequestError extends Error {
+  constructor(message: string, public status: number) {
+    super(message);
+  }
+}
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const res = await fetch(BASE_URL + path, {
     ...init,
@@ -20,7 +26,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   });
   const json = (await res.json()) as { data: T };
   if (!res.ok) {
-    throw new Error(`${init.method || 'GET'} ${path} failed (${res.status}): ${JSON.stringify(json)}`);
+    throw new TwentyRequestError(`${init.method || 'GET'} ${path} failed (${res.status}): ${JSON.stringify(json)}`, res.status);
   }
   return json.data;
 }
@@ -140,4 +146,78 @@ export async function getGeographies(): Promise<TwentyTaxonomyRecord[]> {
 
 export async function getSectors(): Promise<TwentyTaxonomyRecord[]> {
   return getAllTaxonomy('/rest/sectors', 'sectors');
+}
+
+// Meridian Phase 9 — engagement scoring and task creation.
+
+export async function getPersonById(id: string): Promise<PersonRecord | null> {
+  try {
+    const data = await request<{ person: PersonRecord }>(`/rest/people/${id}`);
+    return data.person;
+  } catch (err) {
+    if (err instanceof TwentyRequestError && err.status === 404) {
+      return null;
+    }
+    throw err;
+  }
+}
+
+export type TwentyTask = {
+  id: string;
+  title: string;
+  status: 'TODO' | 'IN_PROGRESS' | 'DONE';
+  dueAt: string | null;
+  assigneeId: string | null;
+};
+
+// bodyV2 write shape confirmed against the live instance: passing
+// { markdown, blocknote: null } is enough, Twenty derives the blocknote
+// JSON itself - no need to hand-construct it.
+export async function createTask(fields: {
+  title: string;
+  bodyMarkdown?: string;
+  assigneeId: string;
+  dueAt?: string;
+  status?: 'TODO' | 'IN_PROGRESS' | 'DONE';
+}): Promise<TwentyTask> {
+  const data = await request<{ createTask: TwentyTask }>('/rest/tasks', {
+    method: 'POST',
+    body: JSON.stringify({
+      title: fields.title,
+      assigneeId: fields.assigneeId,
+      status: fields.status ?? 'TODO',
+      dueAt: fields.dueAt,
+      ...(fields.bodyMarkdown ? { bodyV2: { markdown: fields.bodyMarkdown, blocknote: null } } : {}),
+    }),
+  });
+  return data.createTask;
+}
+
+// Task<->Person linkage goes through the taskTarget junction object -
+// Twenty has no MANY_TO_MANY relations in this version, this is its own
+// standard pattern for it (confirmed against the live instance).
+export async function linkTaskToPerson(taskId: string, personId: string): Promise<void> {
+  await request('/rest/taskTargets', {
+    method: 'POST',
+    body: JSON.stringify({ taskId, personId }),
+  });
+}
+
+// Used for duplicate-prevention on the threshold-crossing task trigger.
+// Note: the taskTargets response's own personId/person fields come back
+// null even when the filter matched correctly (confirmed against the live
+// instance) - don't rely on echoed identity fields, only on the expanded
+// `task` object, which does resolve correctly with depth=1.
+export async function findOpenEngagementTaskForPerson(
+  personId: string,
+  markerPrefix: string
+): Promise<TwentyTask | null> {
+  const encoded = encodeURIComponent(`personId[eq]:"${personId}"`);
+  const data = await request<{ taskTargets: { task: TwentyTask | null }[] }>(
+    `/rest/taskTargets?filter=${encoded}&depth=1&limit=50`
+  );
+  const match = data.taskTargets.find(
+    (tt) => tt.task && tt.task.status !== 'DONE' && tt.task.title.startsWith(markerPrefix)
+  );
+  return match?.task ?? null;
 }
