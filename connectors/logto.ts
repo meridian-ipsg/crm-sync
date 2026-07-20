@@ -22,17 +22,35 @@
 
 import parsePhoneNumber from 'libphonenumber-js';
 import { updateUserCustomData } from '../lib/logtoClient';
-import { upsertPersonByLogtoUserId, upsertPersonForSignup } from '../lib/twentyClient';
+import {
+  syncPersonGeographyPreferences,
+  syncPersonTopicPreferences,
+  syncSubscriberTier,
+  upsertPersonByLogtoUserId,
+  upsertPersonForSignup,
+} from '../lib/twentyClient';
 
 // Partial shape of Logto's webhook payload for the data-mutation events
 // (User.Created / User.Data.Updated). See
 // https://docs.logto.io/developers/webhooks/webhooks-request - only the
-// fields this connector reads are typed here.
+// fields this connector reads are typed here. customData is assumed present
+// on User.Data.Updated per Logto's webhook docs - carries
+// topic_crm_ids/geography_crm_ids (written by the portal via the Logto
+// Management API, Meridian Phase 14) and subscription_tier (set manually
+// today, Stripe writeback deferred per Phase 8b). Verify this against a
+// real received payload before relying on it in production - see the build
+// notes.
 type LogtoUserEventData = {
   id: string;
   name: string | null;
   primaryEmail: string | null;
   primaryPhone: string | null;
+  customData?: {
+    topic_crm_ids?: string[];
+    geography_crm_ids?: string[];
+    subscription_tier?: string;
+    [key: string]: unknown;
+  };
 };
 
 type DataMutationPayload = {
@@ -111,14 +129,40 @@ export async function handleLogtoWebhook(payload: LogtoWebhookPayload): Promise<
   if (payload.event === 'User.Data.Updated') {
     const { data } = payload as DataMutationPayload;
     const fields = buildIdentityFields(data);
-    await upsertPersonByLogtoUserId(data.id, fields);
+    const person = await upsertPersonByLogtoUserId(data.id, fields);
     console.log(`[logto-sync] User.Data.Updated: refreshed Person identity fields for Logto user ${data.id}`);
+    await syncPreferencesAndTier(person.id, data.id, data.customData);
     return;
   }
 
   // Any other subscribed event this hook isn't built to handle yet - ignore
   // rather than error, so an unrelated future event type added to the same
   // hook doesn't take the whole webhook down.
+}
+
+// Meridian Phase 14 - reconciles topic/geography preferences and
+// subscriber tier from Logto custom data onto the linked Twenty Person.
+// Runs on every User.Data.Updated, not just ones that actually touched
+// preferences/tier - the reconcile functions are idempotent no-ops when the
+// desired set already matches, so this is safe and simpler than trying to
+// diff which specific custom-data keys changed.
+async function syncPreferencesAndTier(
+  personId: string,
+  logtoUserId: string,
+  customData: LogtoUserEventData['customData']
+): Promise<void> {
+  if (!customData) return;
+
+  if (Array.isArray(customData.topic_crm_ids)) {
+    await syncPersonTopicPreferences(personId, customData.topic_crm_ids);
+  }
+  if (Array.isArray(customData.geography_crm_ids)) {
+    await syncPersonGeographyPreferences(personId, customData.geography_crm_ids);
+  }
+  if (typeof customData.subscription_tier === 'string') {
+    await syncSubscriberTier(personId, customData.subscription_tier);
+  }
+  console.log(`[logto-sync] User.Data.Updated: synced preferences/tier for Logto user ${logtoUserId}`);
 }
 
 async function handleSignup(user: NormalizedUser): Promise<void> {

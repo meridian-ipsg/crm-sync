@@ -203,6 +203,117 @@ export async function linkTaskToPerson(taskId: string, personId: string): Promis
   });
 }
 
+// Meridian Phase 14 — topic/geography email preferences and subscriber tier.
+//
+// topicPreference/geographyPreference are pre-existing junction objects
+// (created 2026-07-03, alongside Topic/Geography themselves - predates this
+// phase, confirmed via /rest/metadata/objects, not something this phase adds
+// via the Metadata API). Twenty has no MANY_TO_MANY relations in this
+// version, so a Person's preferred topics/geographies are modelled as one
+// junction row per (person, topic) / (person, geography) pair, same pattern
+// taskTarget already uses for Task<->Person.
+//
+// The ids this connector receives (topic_crm_ids/geography_crm_ids off
+// Logto custom data) are already Twenty's own topic/geography record ids -
+// the website resolves Payload's crm_id field to get them, so no
+// slug/name lookup happens here.
+
+export type TopicPreferenceRecord = { id: string; topicId: string };
+export type GeographyPreferenceRecord = { id: string; geographyId: string };
+
+export async function getPersonTopicPreferences(personId: string): Promise<TopicPreferenceRecord[]> {
+  const encoded = encodeURIComponent(`personId[eq]:"${personId}"`);
+  const data = await request<{ topicPreferences: { id: string; topicId: string }[] }>(
+    `/rest/topicPreferences?filter=${encoded}&limit=100`
+  );
+  return data.topicPreferences.map((r) => ({ id: r.id, topicId: r.topicId }));
+}
+
+export async function getPersonGeographyPreferences(personId: string): Promise<GeographyPreferenceRecord[]> {
+  const encoded = encodeURIComponent(`personId[eq]:"${personId}"`);
+  const data = await request<{ geographyPreferences: { id: string; geographyId: string }[] }>(
+    `/rest/geographyPreferences?filter=${encoded}&limit=100`
+  );
+  return data.geographyPreferences.map((r) => ({ id: r.id, geographyId: r.geographyId }));
+}
+
+async function createTopicPreference(personId: string, topicId: string): Promise<void> {
+  await request('/rest/topicPreferences', {
+    method: 'POST',
+    body: JSON.stringify({ personId, topicId }),
+  });
+}
+
+async function createGeographyPreference(personId: string, geographyId: string): Promise<void> {
+  await request('/rest/geographyPreferences', {
+    method: 'POST',
+    body: JSON.stringify({ personId, geographyId }),
+  });
+}
+
+async function deleteTopicPreference(id: string): Promise<void> {
+  await request(`/rest/topicPreferences/${id}`, { method: 'DELETE' });
+}
+
+async function deleteGeographyPreference(id: string): Promise<void> {
+  await request(`/rest/geographyPreferences/${id}`, { method: 'DELETE' });
+}
+
+// Reconciles a Person's topicPreference rows to match the desired set of
+// Twenty topic ids exactly - creates what's missing, deletes what's no
+// longer wanted, leaves matches untouched. Idempotent: calling twice with
+// the same desired set is a no-op the second time.
+export async function syncPersonTopicPreferences(personId: string, desiredTopicIds: string[]): Promise<void> {
+  const existing = await getPersonTopicPreferences(personId);
+  const desired = new Set(desiredTopicIds);
+  const existingByTopicId = new Map(existing.map((r) => [r.topicId, r.id]));
+
+  const toCreate = desiredTopicIds.filter((id) => !existingByTopicId.has(id));
+  const toDelete = existing.filter((r) => !desired.has(r.topicId));
+
+  await Promise.all([
+    ...toCreate.map((topicId) => createTopicPreference(personId, topicId)),
+    ...toDelete.map((r) => deleteTopicPreference(r.id)),
+  ]);
+}
+
+export async function syncPersonGeographyPreferences(
+  personId: string,
+  desiredGeographyIds: string[]
+): Promise<void> {
+  const existing = await getPersonGeographyPreferences(personId);
+  const desired = new Set(desiredGeographyIds);
+  const existingByGeographyId = new Map(existing.map((r) => [r.geographyId, r.id]));
+
+  const toCreate = desiredGeographyIds.filter((id) => !existingByGeographyId.has(id));
+  const toDelete = existing.filter((r) => !desired.has(r.geographyId));
+
+  await Promise.all([
+    ...toCreate.map((geographyId) => createGeographyPreference(personId, geographyId)),
+    ...toDelete.map((r) => deleteGeographyPreference(r.id)),
+  ]);
+}
+
+// Logto's subscription_tier custom-data value ('free'/'standard'/
+// 'professional', lowercase) vs Twenty's subscriberTier SELECT options
+// (FREE/STANDARD/PROFESSIONAL, uppercase, confirmed via
+// /rest/metadata/objects - no ENTERPRISE option exists in this version,
+// Enterprise accounts are handled manually per the technical notes).
+const SUBSCRIBER_TIER_MAP: Record<string, string> = {
+  free: 'FREE',
+  standard: 'STANDARD',
+  professional: 'PROFESSIONAL',
+};
+
+export async function syncSubscriberTier(personId: string, logtoTier: string): Promise<void> {
+  const twentyTier = SUBSCRIBER_TIER_MAP[logtoTier];
+  if (!twentyTier) {
+    console.warn(`[twentyClient] unrecognized subscription_tier "${logtoTier}", not writing subscriberTier`);
+    return;
+  }
+  await updatePerson(personId, { subscriberTier: twentyTier });
+}
+
 // Used for duplicate-prevention on the threshold-crossing task trigger.
 // Note: the taskTargets response's own personId/person fields come back
 // null even when the filter matched correctly (confirmed against the live
