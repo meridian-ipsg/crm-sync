@@ -48,33 +48,34 @@ type DataMutationPayload = {
   data: LogtoUserEventData;
 };
 
-// User.Data.Updated's real payload shape, confirmed 2026-07-21 against a
-// live Logto hook delivery log (Meridian Phase 14 build) - this is NOT a
-// "here's the updated user object" event like User.Created. It's Logto's
-// generic "an API call touched this user's data" envelope: whichever
-// Management API endpoint fired it, `data.data` is that call's own request
-// body verbatim and `data.params.userId` is the affected user's id. A prior
-// version of this connector assumed a flat user-object shape here
-// (`data.id`/`data.name`/...) - that was never actually exercised by a
-// real webhook before this phase (confirmed: this hook's delivery log had
-// exactly zero prior User.Data.Updated entries), and the wrong assumption
-// caused a real bug caught during this phase's live verification: a blank
-// Person record got created in the shared Twenty tenant from a call with
-// no real `id`. Fixed below by reading the real fields and never creating
-// a Person from this event - see handleDataUpdated.
+// User.Data.Updated's real payload shape, confirmed 2026-07-21 against two
+// live deliveries (Meridian Phase 14 build, first attempt got this wrong,
+// second confirmed it) - this is NOT a "here's the updated user object"
+// event like User.Created. It's Logto's generic "an API call touched this
+// user's data" envelope, and its fields (`data`, `params`, `path`,
+// `method`, ...) sit alongside `event`/`createdAt` at the TOP level of the
+// payload, not nested under an inner `data` wrapper the way the first fix
+// attempt assumed by pattern-matching User.Created's shape. `data` here is
+// that call's own request body verbatim, `params.userId` is the affected
+// user's id. A prior version of this connector assumed a flat user-object
+// shape (`data.id`/`data.name`/...) that was never actually exercised by a
+// real webhook before this phase (this hook's delivery log had zero prior
+// User.Data.Updated entries), and the wrong assumption caused a real bug
+// caught during this phase's live verification: a blank Person record got
+// created in the shared Twenty tenant from a call with no real `id`. Fixed
+// by reading the real fields and never creating a Person from this event -
+// see handleDataUpdated.
 type CustomDataUpdatedPayload = {
   event: 'User.Data.Updated';
   createdAt: string;
+  path: string;
+  method: string;
+  params: { userId?: string };
   data: {
-    path: string;
-    method: string;
-    params: { userId?: string };
-    data: {
-      topic_crm_ids?: string[];
-      geography_crm_ids?: string[];
-      subscription_tier?: string;
-      [key: string]: unknown;
-    };
+    topic_crm_ids?: string[];
+    geography_crm_ids?: string[];
+    subscription_tier?: string;
+    [key: string]: unknown;
   };
 };
 
@@ -150,7 +151,7 @@ export async function handleLogtoWebhook(payload: LogtoWebhookPayload): Promise<
   }
 
   if (payload.event === 'User.Data.Updated') {
-    await handleDataUpdated((payload as CustomDataUpdatedPayload).data);
+    await handleDataUpdated(payload as CustomDataUpdatedPayload);
     return;
   }
 
@@ -175,14 +176,14 @@ export async function handleLogtoWebhook(payload: LogtoWebhookPayload): Promise<
 // guessing - the bug this replaced did exactly that guessing and created a
 // blank Person in the shared Twenty tenant, caught during this phase's
 // live verification.
-async function handleDataUpdated(data: CustomDataUpdatedPayload['data']): Promise<void> {
-  const logtoUserId = data.params?.userId;
+async function handleDataUpdated(payload: CustomDataUpdatedPayload): Promise<void> {
+  const logtoUserId = payload.params?.userId;
   if (!logtoUserId) {
-    console.warn('[logto-sync] User.Data.Updated payload had no params.userId, skipping', JSON.stringify(data));
+    console.warn('[logto-sync] User.Data.Updated payload had no params.userId, skipping', JSON.stringify(payload));
     return;
   }
 
-  const patch = data.data ?? {};
+  const patch = payload.data ?? {};
   const hasRecognisedKey =
     Array.isArray(patch.topic_crm_ids) || Array.isArray(patch.geography_crm_ids) || typeof patch.subscription_tier === 'string';
   if (!hasRecognisedKey) return;
